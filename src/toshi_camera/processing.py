@@ -13,10 +13,19 @@ class FrameSettings:
     saturation: int = 0  # -100 .. +100
     mirror_horizontal: bool = False
     flip_vertical: bool = False
+    rotation_deg: int = 0  # 0, 90, 180, 270
 
 
 def apply_adjustments(frame: np.ndarray, settings: FrameSettings) -> np.ndarray:
     out = frame.copy()
+
+    rot = settings.rotation_deg % 360
+    if rot == 90:
+        out = cv2.rotate(out, cv2.ROTATE_90_CLOCKWISE)
+    elif rot == 180:
+        out = cv2.rotate(out, cv2.ROTATE_180)
+    elif rot == 270:
+        out = cv2.rotate(out, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     if settings.mirror_horizontal and settings.flip_vertical:
         out = cv2.flip(out, -1)

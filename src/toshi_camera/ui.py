@@ -18,6 +18,7 @@ from PyQt6.QtGui import (
     QPixmap,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -41,17 +42,23 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from toshi_camera.audio_bridge import FfmpegAudioVideoRecorder, VirtualMicBridge
 from toshi_camera.diagnostics import (
     HardwareReport,
     collect_live_hardware_report,
     discover_video_devices,
+)
+from toshi_camera.phone_bridge import (
+    PhoneBridgeServer,
+    discover_lan_ips,
+    generate_qr_image,
 )
 from toshi_camera.processing import (
     FrameSettings,
     apply_adjustments,
     generate_test_frame,
 )
-from toshi_camera.storage import MediaStorage
+from toshi_camera.storage import MediaStorage, get_default_saves_dir
 from toshi_camera.virtual_cam import VirtualCamBridge, validate_stream_url
 
 
@@ -193,13 +200,207 @@ class DiagnosticsDialog(QDialog):
         root_layout.addWidget(button_box)
 
 
+class PhoneConnectDialog(QDialog):
+    """QR-code LAN pairing dialog for using a phone camera without installing an app."""
+
+    def __init__(
+        self,
+        server: PhoneBridgeServer,
+        ips: Optional[list[str]] = None,
+        auto_bridge: bool = True,
+        auto_mic: bool = True,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._server = server
+        self._ips = ips or discover_lan_ips()
+        self.setWindowTitle("Telefon Kamerasını Bağla — Toshi Kamera")
+        self.setWindowIcon(
+            QIcon.fromTheme(
+                "camera-web",
+                self.style().standardIcon(
+                    self.style().StandardPixmap.SP_ComputerIcon
+                ),
+            )
+        )
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(12)
+
+        title_lbl = QLabel("Telefondan Uygulamasız Kamera Bağlantısı")
+        title_font = QFont(title_lbl.font())
+        title_font.setPointSize(title_font.pointSize() + 2)
+        title_font.setBold(True)
+        title_lbl.setFont(title_font)
+        title_lbl.setWordWrap(True)
+        root_layout.addWidget(title_lbl)
+
+        content_row = QHBoxLayout()
+        content_row.setSpacing(16)
+
+        qr_group = QGroupBox("QR Kodu Okutun")
+        qr_layout = QVBoxLayout(qr_group)
+        qr_layout.setContentsMargins(12, 12, 12, 12)
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qr_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.qr_label.setFrameShadow(QFrame.Shadow.Sunken)
+        self.qr_label.setAutoFillBackground(True)
+        self.qr_label.setBackgroundRole(QPalette.ColorRole.Base)
+        self.qr_label.setMinimumSize(220, 220)
+        qr_layout.addWidget(self.qr_label)
+        content_row.addWidget(qr_group)
+
+        net_group = QGroupBox("Ağ ve Köprü Ayarları")
+        net_layout = QVBoxLayout(net_group)
+        net_layout.setContentsMargins(12, 12, 12, 12)
+        net_layout.setSpacing(8)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self.ip_combo = QComboBox()
+        self.ip_combo.setMinimumHeight(36)
+        for ip in self._ips:
+            self.ip_combo.addItem(ip, ip)
+        self.ip_combo.currentIndexChanged.connect(self._refresh_qr_and_url)
+        lbl_ip = QLabel("Ağ &arayüzü")
+        lbl_ip.setBuddy(self.ip_combo)
+
+        self.url_edit = QLineEdit()
+        self.url_edit.setReadOnly(True)
+        self.url_edit.setMinimumHeight(36)
+        lbl_url = QLabel("Bağlantı &adresi")
+        lbl_url.setBuddy(self.url_edit)
+
+        self.status_lbl = QLabel("Telefon bağlantısı bekleniyor…")
+        self.status_lbl.setWordWrap(True)
+
+        form.addRow(lbl_ip, self.ip_combo)
+        form.addRow(lbl_url, self.url_edit)
+        form.addRow(QLabel("Durum"), self.status_lbl)
+        net_layout.addLayout(form)
+
+        self.auto_bridge_checkbox = QCheckBox(
+            "Bağlanınca /dev/video0 sanal kamerasını otomatik başlat"
+        )
+        self.auto_bridge_checkbox.setChecked(auto_bridge)
+        net_layout.addWidget(self.auto_bridge_checkbox)
+
+        self.auto_mic_checkbox = QCheckBox(
+            "Bağlanınca telefon mikrofonunu sanal mikrofon olarak başlat"
+        )
+        self.auto_mic_checkbox.setChecked(auto_mic)
+        net_layout.addWidget(self.auto_mic_checkbox)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.copy_btn = QPushButton("&Adresi Kopyala")
+        self.copy_btn.setMinimumHeight(36)
+        self.copy_btn.setIcon(QIcon.fromTheme("edit-copy"))
+        self.copy_btn.clicked.connect(self._copy_url)
+
+        self.regen_btn = QPushButton("&Tokeni Yenile")
+        self.regen_btn.setMinimumHeight(36)
+        self.regen_btn.setIcon(QIcon.fromTheme("view-refresh"))
+        self.regen_btn.clicked.connect(self._regenerate_token)
+
+        btn_row.addWidget(self.copy_btn)
+        btn_row.addWidget(self.regen_btn)
+        net_layout.addLayout(btn_row)
+        net_layout.addStretch(1)
+        content_row.addWidget(net_group, stretch=1)
+
+        root_layout.addLayout(content_row)
+
+        guide_group = QGroupBox("Nasıl Bağlanılır?")
+        guide_layout = QVBoxLayout(guide_group)
+        guide_layout.setContentsMargins(12, 12, 12, 12)
+        guide_lbl = QLabel(
+            "1. Telefon ve bilgisayar aynı Wi-Fi ağında olmalıdır.\n"
+            "2. Telefon kamerasıyla QR kodu okutup bağlantıyı tarayıcıda açın.\n"
+            "3. İlk açılışta yerel HTTPS güvenlik uyarısında "
+            "\"Gelişmiş → Devam Et\" adımını onaylayıp kamera izni verin."
+        )
+        guide_lbl.setWordWrap(True)
+        guide_layout.addWidget(guide_lbl)
+        root_layout.addWidget(guide_group)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_btn = button_box.button(QDialogButtonBox.StandardButton.Close)
+        if close_btn is not None:
+            close_btn.setText("&Kapat")
+            close_btn.setDefault(True)
+        button_box.rejected.connect(self.reject)
+        button_box.accepted.connect(self.accept)
+        root_layout.addWidget(button_box)
+
+        self.setTabOrder(self.ip_combo, self.url_edit)
+        self.setTabOrder(self.url_edit, self.auto_bridge_checkbox)
+        self.setTabOrder(self.auto_bridge_checkbox, self.auto_mic_checkbox)
+        self.setTabOrder(self.auto_mic_checkbox, self.copy_btn)
+        self.setTabOrder(self.copy_btn, self.regen_btn)
+
+        self._refresh_qr_and_url()
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(500)
+        self._poll_timer.timeout.connect(self._update_status)
+        self._poll_timer.start()
+        self._update_status()
+
+    def _selected_ip(self) -> str:
+        ip = self.ip_combo.currentData()
+        return str(ip) if ip else "127.0.0.1"
+
+    def _refresh_qr_and_url(self) -> None:
+        url = self._server.build_url(self._selected_ip())
+        self.url_edit.setText(url)
+        qr_img = generate_qr_image(url, scale=6, border=4)
+        h, w = qr_img.shape[:2]
+        qimg = QImage(qr_img.data, w, h, w, QImage.Format.Format_Grayscale8).copy()
+        self.qr_label.setPixmap(QPixmap.fromImage(qimg))
+
+    def _copy_url(self) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(self.url_edit.text())
+        self.status_lbl.setText("Bağlantı adresi panoya kopyalandı")
+
+    def _regenerate_token(self) -> None:
+        self._server.regenerate_token()
+        self._refresh_qr_and_url()
+        self.status_lbl.setText("Yeni oturum anahtarı üretildi; QR kodu yeniden okutun")
+
+    def _update_status(self) -> None:
+        if self._server.is_client_connected():
+            info = self._server.client_info() or "Telefon"
+            fps = self._server.current_fps()
+            mic_txt = " • Mikrofon aktif" if self._server.is_audio_active() else ""
+            self.status_lbl.setText(f"Bağlandı ({info} — {fps:.1f} FPS{mic_txt})")
+        else:
+            self.status_lbl.setText("Telefon bağlantısı bekleniyor…")
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._poll_timer.stop()
+        super().closeEvent(event)
+
+
 class CameraMainWindow(QMainWindow):
     """Main camera application window adhering to Apple HIG and Qt QWidgets standards."""
 
     RESOLUTIONS = [
-        ("640 × 480 (VGA)", 640, 480),
-        ("1280 × 720 (HD)", 1280, 720),
+        ("640 × 480 (VGA — Yatay)", 640, 480),
+        ("480 × 640 (VGA — Dikey)", 480, 640),
+        ("1280 × 720 (HD — Yatay)", 1280, 720),
+        ("720 × 1280 (HD — Dikey)", 720, 1280),
         ("320 × 240 (QVGA)", 320, 240),
+    ]
+    ROTATIONS = [
+        ("0° (Normal)", 0),
+        ("90° Saat Yönü", 90),
+        ("180° Baş Aşağı", 180),
+        ("270° Saat Yönü Ters", 270),
     ]
     TIMERS = [
         ("Kapalı (Anında)", 0),
@@ -212,6 +413,8 @@ class CameraMainWindow(QMainWindow):
         self,
         storage: Optional[MediaStorage] = None,
         auto_start_capture: bool = True,
+        phone_bridge: Optional[PhoneBridgeServer] = None,
+        virtual_mic: Optional[VirtualMicBridge] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -225,17 +428,24 @@ class CameraMainWindow(QMainWindow):
             )
         )
 
-        default_photo_dir = Path.home() / "Resimler" / "Kamera"
-        default_video_dir = Path.home() / "Videolar" / "Kamera"
-        self.storage = storage or MediaStorage(default_photo_dir, default_video_dir)
+        saves_dir = get_default_saves_dir()
+        self.storage = storage or MediaStorage(saves_dir, saves_dir)
         self.virtual_bridge = VirtualCamBridge(target_device="/dev/video0")
+        self.virtual_mic = virtual_mic or VirtualMicBridge()
+        self.phone_bridge = phone_bridge or PhoneBridgeServer()
+        self.phone_bridge.set_audio_callback(self._on_phone_audio_chunk)
 
         self._cap: Optional[cv2.VideoCapture] = None
         self._video_writer: Optional[cv2.VideoWriter] = None
+        self._av_recorder: Optional[FfmpegAudioVideoRecorder] = None
         self._recording_path: Optional[Path] = None
         self._frame_index: int = 0
         self._last_frame: Optional[np.ndarray] = None
         self._countdown_remaining: int = 0
+        self._auto_bridge_on_phone: bool = True
+        self._auto_mic_on_phone: bool = True
+        self._phone_bridge_auto_started: bool = False
+        self._phone_mic_auto_started: bool = False
 
         self._build_ui()
         self._build_shortcuts()
@@ -287,6 +497,11 @@ class CameraMainWindow(QMainWindow):
         self.video_btn.setIcon(QIcon.fromTheme("media-record"))
         self.video_btn.clicked.connect(self.toggle_video_recording)
 
+        self.phone_btn = QPushButton("&Telefon Bağla (QR)")
+        self.phone_btn.setMinimumHeight(44)
+        self.phone_btn.setIcon(QIcon.fromTheme("phone", QIcon.fromTheme("camera-web")))
+        self.phone_btn.clicked.connect(self.open_phone_connect_dialog)
+
         self.diag_btn = QPushButton("&Donanım Tanılama")
         self.diag_btn.setMinimumHeight(44)
         self.diag_btn.setIcon(QIcon.fromTheme("dialog-information"))
@@ -295,6 +510,7 @@ class CameraMainWindow(QMainWindow):
         action_bar.addWidget(self.photo_btn)
         action_bar.addWidget(self.video_btn)
         action_bar.addStretch(1)
+        action_bar.addWidget(self.phone_btn)
         action_bar.addWidget(self.diag_btn)
         left_layout.addLayout(action_bar)
 
@@ -384,6 +600,13 @@ class CameraMainWindow(QMainWindow):
         lbl_sat = QLabel("Do&ygunluk")
         lbl_sat.setBuddy(self.saturation_slider)
 
+        self.rotation_combo = QComboBox()
+        self.rotation_combo.setMinimumHeight(36)
+        for title, deg in self.ROTATIONS:
+            self.rotation_combo.addItem(title, deg)
+        lbl_rot = QLabel("&Döndürme")
+        lbl_rot.setBuddy(self.rotation_combo)
+
         self.mirror_checkbox = QCheckBox("Yatay ayna görüntüsü")
         self.flip_checkbox = QCheckBox("Dikey çevir")
 
@@ -395,6 +618,7 @@ class CameraMainWindow(QMainWindow):
         adj_form.addRow(lbl_bright, self.brightness_slider)
         adj_form.addRow(lbl_contrast, self.contrast_slider)
         adj_form.addRow(lbl_sat, self.saturation_slider)
+        adj_form.addRow(lbl_rot, self.rotation_combo)
         adj_form.addRow(self.mirror_checkbox)
         adj_form.addRow(self.flip_checkbox)
         adj_form.addRow(self.reset_adj_btn)
@@ -416,12 +640,18 @@ class CameraMainWindow(QMainWindow):
         self.open_media_btn.setIcon(QIcon.fromTheme("document-open"))
         self.open_media_btn.clicked.connect(self.open_selected_media)
 
+        self.open_folder_btn = QPushButton("K&lasörü Aç")
+        self.open_folder_btn.setMinimumHeight(36)
+        self.open_folder_btn.setIcon(QIcon.fromTheme("folder-open"))
+        self.open_folder_btn.clicked.connect(self.open_saves_folder)
+
         self.delete_media_btn = QPushButton("Seçiliyi S&il")
         self.delete_media_btn.setMinimumHeight(36)
         self.delete_media_btn.setIcon(QIcon.fromTheme("edit-delete"))
         self.delete_media_btn.clicked.connect(self.delete_selected_media)
 
         gallery_btn_row.addWidget(self.open_media_btn)
+        gallery_btn_row.addWidget(self.open_folder_btn)
         gallery_btn_row.addWidget(self.delete_media_btn)
         gallery_layout.addLayout(gallery_btn_row)
         right_layout.addWidget(gallery_group, stretch=1)
@@ -431,7 +661,8 @@ class CameraMainWindow(QMainWindow):
 
         # Logical keyboard tab order
         self.setTabOrder(self.photo_btn, self.video_btn)
-        self.setTabOrder(self.video_btn, self.diag_btn)
+        self.setTabOrder(self.video_btn, self.phone_btn)
+        self.setTabOrder(self.phone_btn, self.diag_btn)
         self.setTabOrder(self.diag_btn, self.source_combo)
         self.setTabOrder(self.source_combo, self.stream_url_edit)
         self.setTabOrder(self.stream_url_edit, self.resolution_combo)
@@ -441,12 +672,14 @@ class CameraMainWindow(QMainWindow):
         self.setTabOrder(self.bridge_btn, self.brightness_slider)
         self.setTabOrder(self.brightness_slider, self.contrast_slider)
         self.setTabOrder(self.contrast_slider, self.saturation_slider)
-        self.setTabOrder(self.saturation_slider, self.mirror_checkbox)
+        self.setTabOrder(self.saturation_slider, self.rotation_combo)
+        self.setTabOrder(self.rotation_combo, self.mirror_checkbox)
         self.setTabOrder(self.mirror_checkbox, self.flip_checkbox)
         self.setTabOrder(self.flip_checkbox, self.reset_adj_btn)
         self.setTabOrder(self.reset_adj_btn, self.gallery_list)
         self.setTabOrder(self.gallery_list, self.open_media_btn)
-        self.setTabOrder(self.open_media_btn, self.delete_media_btn)
+        self.setTabOrder(self.open_media_btn, self.open_folder_btn)
+        self.setTabOrder(self.open_folder_btn, self.delete_media_btn)
 
         status = QStatusBar(self)
         self.setStatusBar(status)
@@ -468,6 +701,11 @@ class CameraMainWindow(QMainWindow):
         act_diag.triggered.connect(self.open_diagnostics_dialog)
         self.addAction(act_diag)
 
+        act_phone = QAction("Telefon Bağla (QR)", self)
+        act_phone.setShortcut(QKeySequence("Ctrl+T"))
+        act_phone.triggered.connect(self.open_phone_connect_dialog)
+        self.addAction(act_phone)
+
         act_quit = QAction("Çıkış", self)
         act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         act_quit.triggered.connect(self.close)
@@ -480,16 +718,24 @@ class CameraMainWindow(QMainWindow):
             saturation=self.saturation_slider.value(),
             mirror_horizontal=self.mirror_checkbox.isChecked(),
             flip_vertical=self.flip_checkbox.isChecked(),
+            rotation_deg=int(self.rotation_combo.currentData() or 0),
         )
 
     def reset_adjustments(self) -> None:
         self.brightness_slider.setValue(0)
         self.contrast_slider.setValue(0)
         self.saturation_slider.setValue(0)
+        self.rotation_combo.setCurrentIndex(0)
         self.mirror_checkbox.setChecked(False)
         self.flip_checkbox.setChecked(False)
         if self.statusBar() is not None:
             self.statusBar().showMessage("Görüntü ayarları varsayılana sıfırlandı", 3000)
+
+    def _on_phone_audio_chunk(self, pcm_s16le: bytes) -> None:
+        if self.virtual_mic.is_running():
+            self.virtual_mic.push_pcm(pcm_s16le)
+        if self._av_recorder is not None:
+            self._av_recorder.push_pcm(pcm_s16le)
 
     def refresh_sources(self, auto_open: bool = True) -> None:
         self.source_combo.blockSignals(True)
@@ -500,6 +746,9 @@ class CameraMainWindow(QMainWindow):
             tag = "Sanal Köprü" if dev.is_loopback else "Yerel V4L2"
             self.source_combo.addItem(f"{dev.name} ({dev.path} — {tag})", dev.path)
 
+        self.source_combo.addItem(
+            "Telefon Kamerası (QR Kod — Uygulamasız)", "phone://qr"
+        )
         self.source_combo.addItem(
             "Canlı Kalibrasyon ve Test Sinyali (Dahili)", "test://calibration"
         )
@@ -536,10 +785,56 @@ class CameraMainWindow(QMainWindow):
             return int(data[0]), int(data[1])
         return 640, 480
 
+    def _fit_frame_to_canvas(
+        self, frame: np.ndarray, target_w: int, target_h: int
+    ) -> np.ndarray:
+        fh, fw = frame.shape[:2]
+        if fw == target_w and fh == target_h:
+            return frame
+        scale = min(target_w / max(1, fw), target_h / max(1, fh))
+        new_w = max(1, int(round(fw * scale)))
+        new_h = max(1, int(round(fh * scale)))
+        resized = cv2.resize(frame, (new_w, new_h))
+        if new_w == target_w and new_h == target_h:
+            return resized
+        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        x0 = (target_w - new_w) // 2
+        y0 = (target_h - new_h) // 2
+        canvas[y0 : y0 + new_h, x0 : x0 + new_w] = resized
+        return canvas
+
     def _on_source_changed(self) -> None:
         self._release_capture()
         source_data = self.source_combo.currentData()
         w, h = self._selected_resolution()
+
+        if self.virtual_bridge.is_pipe_mode():
+            if isinstance(source_data, str) and source_data == "/dev/video0":
+                self.virtual_bridge.stop()
+                self.bridge_btn.setChecked(False)
+                self.bridge_btn.setText("&Sanal Köprüyü Başlat")
+            else:
+                self.virtual_bridge.start_pipe(width=w, height=h, fps=30)
+
+        if source_data == "phone://qr":
+            try:
+                if not self.phone_bridge.is_running():
+                    self.phone_bridge.start()
+                if self.statusBar() is not None:
+                    if self.phone_bridge.is_client_connected():
+                        self.statusBar().showMessage(
+                            f"Telefon kamerası bağlı ({self.phone_bridge.client_info()})"
+                        )
+                    else:
+                        self.statusBar().showMessage(
+                            "Telefon kamerası (QR Kod) hazır — bağlanmak için 'Telefon Bağla (QR)' butonuna basın"
+                        )
+            except Exception as exc:
+                if self.statusBar() is not None:
+                    self.statusBar().showMessage(
+                        f"Telefon köprüsü başlatılamadı: {exc}", 5000
+                    )
+            return
 
         if isinstance(source_data, str) and source_data.startswith("/dev/video"):
             cap = cv2.VideoCapture(source_data, cv2.CAP_V4L2)
@@ -577,9 +872,56 @@ class CameraMainWindow(QMainWindow):
 
     def _on_tick(self) -> None:
         w, h = self._selected_resolution()
+        source_data = self.source_combo.currentData()
         frame: Optional[np.ndarray] = None
 
-        if self._cap is not None and self._cap.isOpened():
+        if source_data == "phone://qr":
+            latest = self.phone_bridge.get_latest_frame()
+            if latest is not None:
+                raw_phone, _ = latest
+                frame = raw_phone
+                if (
+                    self._auto_bridge_on_phone
+                    and self.phone_bridge.is_client_connected()
+                    and not self.virtual_bridge.is_running()
+                    and not self._phone_bridge_auto_started
+                ):
+                    self._phone_bridge_auto_started = True
+                    try:
+                        self.virtual_bridge.start_pipe(width=w, height=h, fps=30)
+                        self.bridge_btn.setChecked(True)
+                        self.bridge_btn.setText("&Sanal Köprüyü Durdur")
+                        if self.statusBar() is not None:
+                            self.statusBar().showMessage(
+                                "Telefon bağlandı — /dev/video0 sanal kamera köprüsü otomatik başlatıldı",
+                                5000,
+                            )
+                    except Exception:
+                        pass
+            if (
+                self._auto_mic_on_phone
+                and self.phone_bridge.is_audio_active()
+                and not self.virtual_mic.is_running()
+                and not self._phone_mic_auto_started
+            ):
+                self._phone_mic_auto_started = True
+                try:
+                    self.virtual_mic.start()
+                    if self.statusBar() is not None:
+                        self.statusBar().showMessage(
+                            "Telefon mikrofonu aktif — Toshi Virtual Mic başlatıldı",
+                            5000,
+                        )
+                except Exception:
+                    pass
+            if frame is None:
+                frame = generate_test_frame(
+                    width=w,
+                    height=h,
+                    frame_index=self._frame_index,
+                    label="Telefon Bekleniyor (QR)",
+                )
+        elif self._cap is not None and self._cap.isOpened():
             ok, raw = self._cap.read()
             if ok and raw is not None and raw.size > 0:
                 frame = cv2.resize(raw, (w, h))
@@ -593,7 +935,8 @@ class CameraMainWindow(QMainWindow):
             )
 
         self._frame_index += 1
-        processed = apply_adjustments(frame, self.current_frame_settings())
+        adjusted = apply_adjustments(frame, self.current_frame_settings())
+        processed = self._fit_frame_to_canvas(adjusted, w, h)
 
         if self._countdown_remaining > 0:
             overlay = processed.copy()
@@ -613,7 +956,12 @@ class CameraMainWindow(QMainWindow):
 
         self._last_frame = processed
 
-        if self._video_writer is not None:
+        if self.virtual_bridge.is_pipe_mode():
+            self.virtual_bridge.push_frame(processed)
+
+        if self._av_recorder is not None:
+            self._av_recorder.write(processed)
+        elif self._video_writer is not None:
             self._video_writer.write(processed)
 
     def trigger_photo_capture(self) -> None:
@@ -650,9 +998,13 @@ class CameraMainWindow(QMainWindow):
         return saved
 
     def toggle_video_recording(self) -> None:
-        if self._video_writer is not None:
-            self._video_writer.release()
-            self._video_writer = None
+        if self._av_recorder is not None or self._video_writer is not None:
+            if self._av_recorder is not None:
+                self._av_recorder.release()
+                self._av_recorder = None
+            if self._video_writer is not None:
+                self._video_writer.release()
+                self._video_writer = None
             saved = self._recording_path
             self._recording_path = None
             self.video_btn.setChecked(False)
@@ -665,6 +1017,23 @@ class CameraMainWindow(QMainWindow):
             return
 
         w, h = self._selected_resolution()
+        if self.phone_bridge.is_audio_active() or self.virtual_mic.is_running():
+            out_path = self.storage.allocate_video_path(prefix="VID", ext="mp4")
+            try:
+                self._av_recorder = FfmpegAudioVideoRecorder(
+                    out_path=out_path, width=w, height=h, fps=25
+                )
+                self._recording_path = out_path
+                self.video_btn.setChecked(True)
+                self.video_btn.setText("&Kaydı Durdur")
+                if self.statusBar() is not None:
+                    self.statusBar().showMessage(
+                        f"Sesli video kaydediliyor: {out_path.name}"
+                    )
+                return
+            except Exception:
+                self._av_recorder = None
+
         out_path = self.storage.allocate_video_path(prefix="VID", ext="avi")
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         writer = cv2.VideoWriter(str(out_path), fourcc, 25.0, (w, h))
@@ -693,13 +1062,21 @@ class CameraMainWindow(QMainWindow):
             return
 
         w, h = self._selected_resolution()
+        source_data = self.source_combo.currentData()
         url_text = self.stream_url_edit.text().strip()
-        source_url = url_text if validate_stream_url(url_text) else None
         try:
-            self.virtual_bridge.start(source_url=source_url, width=w, height=h, fps=30)
+            if source_data == "net://stream" and validate_stream_url(url_text):
+                self.virtual_bridge.start(source_url=url_text, width=w, height=h, fps=30)
+                mode = url_text
+            elif source_data == "phone://qr":
+                self.virtual_bridge.start_pipe(width=w, height=h, fps=30)
+                mode = "Telefon Kamerası (QR)"
+            else:
+                source_url = url_text if validate_stream_url(url_text) else None
+                self.virtual_bridge.start(source_url=source_url, width=w, height=h, fps=30)
+                mode = source_url or "Canlı Kalibrasyon Akışı"
             self.bridge_btn.setChecked(True)
             self.bridge_btn.setText("&Sanal Köprüyü Durdur")
-            mode = source_url or "Canlı Kalibrasyon Akışı"
             if self.statusBar() is not None:
                 self.statusBar().showMessage(
                     f"/dev/video0 sanal kamerasına akış veriliyor ({mode})", 5000
@@ -728,6 +1105,13 @@ class CameraMainWindow(QMainWindow):
         if path.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def open_saves_folder(self) -> None:
+        folder = self.storage.photo_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        if self.statusBar() is not None:
+            self.statusBar().showMessage(f"Kayıt klasörü açıldı: {folder}", 3000)
+
     def delete_selected_media(self) -> None:
         current = self.gallery_list.currentItem()
         if current is None:
@@ -749,6 +1133,32 @@ class CameraMainWindow(QMainWindow):
                 if self.statusBar() is not None:
                     self.statusBar().showMessage(f"Silindi: {path.name}", 3000)
 
+    def open_phone_connect_dialog(self) -> None:
+        qr_idx = self.source_combo.findData("phone://qr")
+        if qr_idx >= 0 and self.source_combo.currentIndex() != qr_idx:
+            self.source_combo.setCurrentIndex(qr_idx)
+        try:
+            if not self.phone_bridge.is_running():
+                self.phone_bridge.start()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Telefon Köprüsü Hatası",
+                f"Yerel HTTPS sunucusu başlatılamadı:\n{exc}",
+            )
+            return
+        self._phone_bridge_auto_started = False
+        self._phone_mic_auto_started = False
+        dlg = PhoneConnectDialog(
+            server=self.phone_bridge,
+            auto_bridge=self._auto_bridge_on_phone,
+            auto_mic=self._auto_mic_on_phone,
+            parent=self,
+        )
+        dlg.exec()
+        self._auto_bridge_on_phone = dlg.auto_bridge_checkbox.isChecked()
+        self._auto_mic_on_phone = dlg.auto_mic_checkbox.isChecked()
+
     def open_diagnostics_dialog(self) -> None:
         report = collect_live_hardware_report()
         dlg = DiagnosticsDialog(report, self)
@@ -757,9 +1167,15 @@ class CameraMainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._frame_timer.stop()
         self._countdown_timer.stop()
+        if self._av_recorder is not None:
+            self._av_recorder.release()
+            self._av_recorder = None
         if self._video_writer is not None:
             self._video_writer.release()
             self._video_writer = None
         self._release_capture()
+        self.phone_bridge.set_audio_callback(None)
         self.virtual_bridge.stop()
+        self.virtual_mic.stop()
+        self.phone_bridge.stop()
         super().closeEvent(event)

@@ -15,6 +15,12 @@ class MediaItem:
     created_at: float
 
 
+def get_default_saves_dir() -> Path:
+    saves_dir = Path.home() / "Kamera"
+    saves_dir.mkdir(parents=True, exist_ok=True)
+    return saves_dir
+
+
 class MediaStorage:
     PHOTO_EXTS = {".png", ".jpg", ".jpeg"}
     VIDEO_EXTS = {".avi", ".mp4", ".mkv"}

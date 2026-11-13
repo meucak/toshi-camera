@@ -3,6 +3,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from pathlib import Path
+import numpy as np
 from PyQt6.QtWidgets import QApplication, QDialogButtonBox, QLabel, QPushButton
 from toshi_camera.diagnostics import HardwareReport, VideoDevice
 from toshi_camera.phone_bridge import PhoneBridgeServer
@@ -207,3 +208,105 @@ def test_main_window_open_saves_folder_button(tmp_path: Path, monkeypatch):
         assert Path(opened_urls[0].toLocalFile()) == saves
     finally:
         win.close()
+
+
+def test_close_event_minimizes_when_stream_active_and_force_quit_closes(
+    tmp_path: Path, monkeypatch
+):
+    storage = MediaStorage(tmp_path / "photos", tmp_path / "videos")
+    srv = PhoneBridgeServer(host="127.0.0.1", port=0, cert_dir=tmp_path / "certs")
+    srv.start()
+    win = CameraMainWindow(
+        storage=storage, auto_start_capture=False, phone_bridge=srv
+    )
+    try:
+        # Simulate active phone client
+        monkeypatch.setattr(srv, "is_client_connected", lambda: True)
+        monkeypatch.setattr("toshi_camera.ui.QSystemTrayIcon.isSystemTrayAvailable", lambda: False)
+
+        minimized = []
+        monkeypatch.setattr(win, "showMinimized", lambda: minimized.append(True))
+
+        # Regular close (clicking X) must minimize and keep phone bridge running
+        closed = win.close()
+        assert closed is False
+        assert minimized == [True]
+        assert srv.is_running() is True
+
+        # Explicit quit (Ctrl+Q / tray exit) must stop bridge and close
+        assert win.quit_application() is True
+        assert srv.is_running() is False
+    finally:
+        srv.stop()
+
+
+def test_close_event_hides_to_tray_when_tray_available(tmp_path: Path, monkeypatch):
+    storage = MediaStorage(tmp_path / "photos", tmp_path / "videos")
+    srv = PhoneBridgeServer(host="127.0.0.1", port=0, cert_dir=tmp_path / "certs")
+    srv.start()
+    win = CameraMainWindow(
+        storage=storage, auto_start_capture=False, phone_bridge=srv
+    )
+    try:
+        monkeypatch.setattr(srv, "is_client_connected", lambda: True)
+        monkeypatch.setattr("toshi_camera.ui.QSystemTrayIcon.isSystemTrayAvailable", lambda: True)
+
+        class FakeTray:
+            def __init__(self):
+                self.shown = False
+                self.messages = []
+
+            def show(self):
+                self.shown = True
+
+            def hide(self):
+                self.shown = False
+
+            def showMessage(self, title, msg, icon, msecs):
+                self.messages.append((title, msg))
+
+        fake_tray = FakeTray()
+        win._tray_icon = fake_tray  # type: ignore[assignment]
+        hidden = []
+        monkeypatch.setattr(win, "hide", lambda: hidden.append(True))
+
+        assert win.close() is False
+        assert hidden == [True]
+        assert fake_tray.shown is True
+        assert len(fake_tray.messages) == 1
+        assert srv.is_running() is True
+
+        assert win.quit_application() is True
+        assert srv.is_running() is False
+        assert fake_tray.shown is False
+    finally:
+        srv.stop()
+
+
+def test_on_tick_continues_virtual_bridge_push_when_minimized(tmp_path: Path, monkeypatch):
+    storage = MediaStorage(tmp_path / "photos", tmp_path / "videos")
+    srv = PhoneBridgeServer(host="127.0.0.1", port=0, cert_dir=tmp_path / "certs")
+    win = CameraMainWindow(
+        storage=storage, auto_start_capture=False, phone_bridge=srv
+    )
+    try:
+        qr_idx = win.source_combo.findData("phone://qr")
+        assert qr_idx >= 0
+        win.source_combo.setCurrentIndex(qr_idx)
+
+        fake_frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        monkeypatch.setattr(srv, "get_latest_frame", lambda: (fake_frame, 1.0))
+
+        pushed = []
+        viewport_calls = []
+        monkeypatch.setattr(win, "isMinimized", lambda: True)
+        monkeypatch.setattr(win.virtual_bridge, "is_pipe_mode", lambda: True)
+        monkeypatch.setattr(win.virtual_bridge, "push_frame", lambda frame: pushed.append(frame.shape))
+        monkeypatch.setattr(win.viewport, "set_video_frame", lambda frame: viewport_calls.append(True))
+
+        win._on_tick()
+        assert len(pushed) == 1
+        assert viewport_calls == []
+        assert win._last_frame is not None
+    finally:
+        win.quit_application()

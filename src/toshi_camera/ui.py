@@ -32,12 +32,14 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSizePolicy,
     QSlider,
     QSplitter,
     QStatusBar,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -446,6 +448,9 @@ class CameraMainWindow(QMainWindow):
         self._auto_mic_on_phone: bool = True
         self._phone_bridge_auto_started: bool = False
         self._phone_mic_auto_started: bool = False
+        self._force_quit: bool = False
+        self._hidden_to_tray: bool = False
+        self._tray_icon: Optional[QSystemTrayIcon] = None
 
         self._build_ui()
         self._build_shortcuts()
@@ -708,7 +713,7 @@ class CameraMainWindow(QMainWindow):
 
         act_quit = QAction("Çıkış", self)
         act_quit.setShortcut(QKeySequence.StandardKey.Quit)
-        act_quit.triggered.connect(self.close)
+        act_quit.triggered.connect(self.quit_application)
         self.addAction(act_quit)
 
     def current_frame_settings(self) -> FrameSettings:
@@ -938,21 +943,22 @@ class CameraMainWindow(QMainWindow):
         adjusted = apply_adjustments(frame, self.current_frame_settings())
         processed = self._fit_frame_to_canvas(adjusted, w, h)
 
-        if self._countdown_remaining > 0:
-            overlay = processed.copy()
-            cv2.putText(
-                overlay,
-                str(self._countdown_remaining),
-                (w // 2 - 28, h // 2 + 24),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                2.6,
-                (255, 255, 255),
-                4,
-                cv2.LINE_AA,
-            )
-            self.viewport.set_video_frame(overlay)
-        else:
-            self.viewport.set_video_frame(processed)
+        if not self.isMinimized() and not self._hidden_to_tray:
+            if self._countdown_remaining > 0:
+                overlay = processed.copy()
+                cv2.putText(
+                    overlay,
+                    str(self._countdown_remaining),
+                    (w // 2 - 28, h // 2 + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    2.6,
+                    (255, 255, 255),
+                    4,
+                    cv2.LINE_AA,
+                )
+                self.viewport.set_video_frame(overlay)
+            else:
+                self.viewport.set_video_frame(processed)
 
         self._last_frame = processed
 
@@ -1164,7 +1170,81 @@ class CameraMainWindow(QMainWindow):
         dlg = DiagnosticsDialog(report, self)
         dlg.exec()
 
+    def is_stream_active(self) -> bool:
+        return bool(
+            self.phone_bridge.is_client_connected()
+            or self.virtual_bridge.is_running()
+            or self.virtual_mic.is_running()
+        )
+
+    def _ensure_tray_icon(self) -> Optional[QSystemTrayIcon]:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return None
+        if self._tray_icon is not None:
+            return self._tray_icon
+        icon = QIcon.fromTheme("camera-web", QIcon.fromTheme("camera-photo", self.windowIcon()))
+        tray = QSystemTrayIcon(icon, self)
+        tray.setToolTip("Toshi Kamera")
+        menu = QMenu(self)
+        act_show = QAction("Pencereyi Göster", menu)
+        act_show.triggered.connect(self._restore_from_background)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        act_exit = QAction("Tamamen Kapat (Çıkış)", menu)
+        act_exit.triggered.connect(self.quit_application)
+        menu.addAction(act_exit)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        self._tray_icon = tray
+        return tray
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._restore_from_background()
+
+    def _restore_from_background(self) -> None:
+        self._hidden_to_tray = False
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        self._hidden_to_tray = False
+        super().showEvent(event)
+
+    def quit_application(self) -> bool:
+        self._force_quit = True
+        return self.close()
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if not self._force_quit and self.is_stream_active():
+            event.ignore()
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                tray = self._ensure_tray_icon()
+                if tray is not None:
+                    tray.show()
+                self._hidden_to_tray = True
+                self.hide()
+                if tray is not None:
+                    tray.showMessage(
+                        "Toshi Kamera",
+                        "Kamera ve mikrofon aktarımı arka planda sürüyor. Tamamen kapatmak için Ctrl+Q veya tepsi menüsünü kullanın.",
+                        QSystemTrayIcon.MessageIcon.Information,
+                        3000,
+                    )
+            else:
+                self._hidden_to_tray = False
+                self.showMinimized()
+                if self.statusBar() is not None:
+                    self.statusBar().showMessage(
+                        "Aktarım sürdüğü için alta alındı — tamamen kapatmak için Ctrl+Q",
+                        5000,
+                    )
+            return
+
         self._frame_timer.stop()
         self._countdown_timer.stop()
         if self._av_recorder is not None:
@@ -1178,4 +1258,6 @@ class CameraMainWindow(QMainWindow):
         self.virtual_bridge.stop()
         self.virtual_mic.stop()
         self.phone_bridge.stop()
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
         super().closeEvent(event)

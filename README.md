@@ -24,7 +24,7 @@ Terminalden doğrudan:
 ```bash
 kamera
 ```
-Kayıt klasörüne (`~/Kamera`) terminalde geçiş yapmak için:
+Kayıt klasörünü (`~/Kamera`) grafik dosya yöneticisinde açmak için:
 ```bash
 kamera --saves
 ```

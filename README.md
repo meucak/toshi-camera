@@ -18,6 +18,11 @@ sudo apt install python3-pyqt6 python3-opencv python3-numpy ffmpeg v4l-utils v4l
 ```
 
 ### Çalıştırma
+Terminalden doğrudan:
+```bash
+kamera
+```
+veya proje dizininden:
 ```bash
 PYTHONPATH=src python3 -m toshi_camera.main
 ```
